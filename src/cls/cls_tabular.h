@@ -147,6 +147,8 @@ struct query_op {
   std::string index_schema;
   std::string index2_schema;
   std::string query_preds;
+  std::string groupby_cols;
+  std::string orderby_cols;
   std::string index_preds;
   std::string index2_preds;
 
@@ -172,6 +174,8 @@ struct query_op {
     encode(index_schema, bl);
     encode(index2_schema, bl);
     encode(query_preds, bl);
+    encode(groupby_cols, bl);
+    encode(orderby_cols, bl);
     encode(index_preds, bl);
     encode(index2_preds, bl);
   }
@@ -196,6 +200,8 @@ struct query_op {
     decode(index_schema, bl);
     decode(index2_schema, bl);
     decode(query_preds, bl);
+    decode(groupby_cols, bl);
+    decode(orderby_cols, bl);
     decode(index_preds, bl);
     decode(index2_preds, bl);
   }
@@ -218,6 +224,8 @@ struct query_op {
     s.append(" .index_schema=" + index_schema);
     s.append(" .index2_schema=" + index2_schema);
     s.append(" .query_preds=" + query_preds);
+    s.append(" .groupby_cols=" + groupby_cols);
+    s.append(" .orderby_cols=" + orderby_cols);
     s.append(" .index_preds=" + index_preds);
     s.append(" .index2_preds=" + index2_preds);
     return s;
@@ -308,35 +316,31 @@ WRITE_CLASS_ENCODER(test_op)
 
 struct stats_op {
 
-  std::string db_schema;
-  std::string table_name;
+  std::string runstats_args;
   std::string data_schema;
 
   stats_op() {}
-  stats_op(std::string dbscma, std::string tname, std::string dtscma) :
-           db_schema(dbscma), table_name(tname), data_schema(dtscma) { }
+  stats_op(std::string _runstats_args, std::string _data_schema) :
+           runstats_args(_runstats_args), data_schema(_data_schema) { }
 
   // serialize the fields into bufferlist to be sent over the wire
   void encode(bufferlist& bl) const {
     using ceph::encode;
-    encode(db_schema, bl);
-    encode(table_name, bl);
+    encode(runstats_args, bl);
     encode(data_schema, bl);
   }
 
   // deserialize the fields from the bufferlist into this struct
   void decode(bufferlist::const_iterator &bl) {
     using ceph::decode;
-    decode(db_schema, bl);
-    decode(table_name, bl);
+    decode(runstats_args, bl);
     decode(data_schema, bl);
   }
 
   std::string toString() {
     std::string s;
     s.append("stats_op:");
-    s.append(" .db_schema=" + db_schema);
-    s.append(" .table_name=" + table_name);
+    s.append(" .runstats_args=" + runstats_args);
     s.append(" .data_schema=" + data_schema);
     return s;
   }

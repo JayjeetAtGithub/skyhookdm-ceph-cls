@@ -32,6 +32,8 @@ int processSkyFb(
         schema_vec& data_schema,
         schema_vec& query_schema,
         predicate_vec& preds,
+        std::string& groupby_cols,
+        std::string& orderby_cols,
         const char* fb,
         const size_t fb_size,
         std::string& errmsg,
@@ -43,6 +45,8 @@ int processArrowCol(
         schema_vec& tbl_schema,
         schema_vec& query_schema,
         predicate_vec& preds,
+        std::string& groupby_cols,
+        std::string& orderby_cols,
         const char* dataptr,
         const size_t datasz,
         std::string& errmsg,
@@ -75,6 +79,17 @@ int processSkyFbWASM(
         int _errmsg_len,
         int* _row_nums,
         int _row_nums_size);
+
+// process flatbuffer format data blob, build histogram
+//template<typename T>
+int processStatsFb(
+        flatbuffers::FlatBufferBuilder& flatbldr,
+        schema_vec& data_schema,
+        Tables::StatsArgument<int32_t>* s,
+        const char* dataptr,
+        const size_t datasz,
+        std::string& errmsg,
+        const std::vector<uint32_t>& row_nums);
 
 } // end namespace Tables
 

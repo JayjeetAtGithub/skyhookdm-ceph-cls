@@ -61,8 +61,11 @@ std::string qop_query_schema;
 std::string qop_index_schema;
 std::string qop_index2_schema;
 std::string qop_query_preds;
+std::string qop_groupby_cols;
+std::string qop_orderby_cols;
 std::string qop_index_preds;
 std::string qop_index2_preds;
+std::string qop_runstats_args;
 
 // build index op params for flatbufs
 bool idx_op_idx_unique;
@@ -74,6 +77,7 @@ std::string idx_op_text_delims;
 
 // transform op params
 int trans_op_format_type;
+bool perform_compaction;
 
 // Example op params
 int expl_func_counter;
@@ -85,8 +89,9 @@ std::string qop_file_name;
 std::string qop_tree_name;
 
 // other exec flags
-bool runstats;
+std::string runstats;
 std::string project_cols;
+bool pushdown_cols_only;
 
 // prints full record header and metadata
 bool print_verbose;
@@ -102,6 +107,8 @@ Tables::schema_vec sky_idx2_schema;
 Tables::predicate_vec sky_qry_preds;
 Tables::predicate_vec sky_idx_preds;
 Tables::predicate_vec sky_idx2_preds;
+
+Tables::schema_vec sky_pushdown_cols_qry_schema;
 
  // these are all intialized in run-query
 std::atomic<unsigned> result_count;
@@ -347,6 +354,30 @@ void worker_exec_build_sky_index_op(librados::IoCtx *ioctx, idx_op op)
   ioctx->close();
 }
 
+void worker_compact_arrow_tables_op(librados::IoCtx *ioctx)
+{
+  while (true) {
+    work_lock.lock();
+    if (target_objects.empty()) {
+      work_lock.unlock();
+      break;
+    }
+    std::string oid = target_objects.back();
+    target_objects.pop_back();
+    work_lock.unlock();
+
+    ceph::bufferlist inbl, outbl;
+
+    if (debug)
+        cout << "DEBUG: query.cc: worker_compact_arrow_tables_op: launching exec for oid=" << oid << endl;
+
+    int ret = ioctx->exec(oid, "tabular", "compact_arrow_tables_op",
+                          inbl, outbl);
+    checkret(ret, 0);
+  }
+  ioctx->close();
+}
+
 void worker_transform_db_op(librados::IoCtx *ioctx, transform_op op)
 {
   while (true) {
@@ -384,8 +415,59 @@ void worker_exec_runstats_op(librados::IoCtx *ioctx, stats_op op)
     }
     std::string oid = target_objects.back();
     target_objects.pop_back();
-    std::cout << "computing stats...table: " << op.table_name << " oid: "
+    std::cout << "computing stats...table: " << op.runstats_args << " oid: "
               << oid << std::endl;
+
+    // Validating input
+    // Step-1 : Check if runstats_args has 5 arguments (col, min, max, bucket, sampling)
+    std::string arguments = op.runstats_args; 
+    boost::trim(arguments);
+    vector<std::string> args;
+    boost::split(args, arguments, boost::is_any_of(","),
+                 boost::token_compress_on);
+    assert(args.size() == 5);
+
+    // Step-2 : Check if the passed column is valid
+    std::string col = args[0];
+    std::string data_schema = op.data_schema;
+
+    boost::trim(col);
+    boost::trim(data_schema);
+
+    boost::to_upper(col);
+
+    assert (!data_schema.empty());
+
+    Tables::schema_vec table_schema = Tables::schemaFromString(data_schema);
+    Tables::schema_vec sv = schemaFromColNames(table_schema, col);
+    if (sv.empty()) {
+      cerr << "Error: colname=" << col << " not present in schema."
+            << std::endl;
+      assert (Tables::TablesErrCodes::RequestedColNotPresent == 0);
+    }
+
+    // Step-3: Validate sampling argument: should be a float > 0 && <= 1
+    float sampling;
+    int err = Tables::strtofloat(args[4], &sampling);
+    if (err != 0) {
+      cerr << "Error: Invalid sampling data type." << std::endl;
+      exit(1);
+    }
+    if (!(sampling >= 0 && sampling <= 1)) {
+      cerr << "Error: Invalid sampling value = " << sampling << " Should lie in range (0, 1]." << std::endl;
+      exit(1);
+    }
+
+    // Step-4 : Check number of buckets: should be int
+    uint64_t number_of_buckets;
+    err = Tables::strtou64(args[3], &number_of_buckets);
+    if (err != 0) {
+      cerr << "Error: Invalid number_of_buckets data type." << std::endl;
+      exit(1);
+    }
+
+    // bucket_min | bucket_max | count | dead_count | star_representation
+
     work_lock.unlock();
 
     ceph::bufferlist inbl, outbl;
@@ -393,6 +475,27 @@ void worker_exec_runstats_op(librados::IoCtx *ioctx, stats_op op)
     encode(op, inbl);
     int ret = ioctx->exec(oid, "tabular", "exec_runstats_op", inbl, outbl);
     checkret(ret, 0);
+
+    ceph::bufferlist result;
+    if (outbl.length() >0) {
+      ceph::bufferlist::const_iterator it = outbl.begin();
+      try {
+        using ceph::decode;
+        decode(result, it);  // unpack the result data bufferlist
+      }
+      catch (ceph::buffer::error&) {
+        std::cerr << "DEBUG: query.cc: exec_stats_op: failed to decode result data into a bufferlist" << std::endl;
+        assert(Tables::TablesErrCodes::EDECODE_BUFFERLIST_FAILURE==0);
+      }
+      if (debug) {
+        cout << "DEBUG: query.cc: exec_stats_op: decoded result.length()=" << result.length() << endl;
+      }
+    }
+    using namespace Tables;
+    sky_meta fbmeta = getSkyMeta(&result);
+    print_data(fbmeta.blob_data,
+              fbmeta.blob_size,
+              fbmeta.blob_format);
   }
   ioctx->close();
 }
@@ -593,6 +696,10 @@ void worker_exec_query_op()
                 more_processing = true;
             }
         }
+	// if pushdown cols only, and there are preds left to process here
+        if (use_cls && pushdown_cols_only && sky_qry_preds.size() > 0) {
+            more_processing = true;
+        }
 
         // nothing left to do here, so we just print results
         if (!more_processing) {
@@ -640,10 +747,52 @@ void worker_exec_query_op()
                     cout << "DEBUG: query.cc: worker:  case SFT_FLATBUF_FLEX_ROW." << endl;
 
                 flatbuffers::FlatBufferBuilder flatbldr(1024); // pre-alloc
-                int ret = processSkyFb(flatbldr,
-                                       sky_tbl_schema,
-                                       sky_qry_schema,
-                                       sky_qry_preds,
+                
+		// new qry_schema and tbl_schema for processing
+		// the col_idx in the schema should reindex starting from 0
+		Tables::schema_vec sky_process_qry_schema;
+		Tables::schema_vec sky_process_tbl_schema;
+		
+                int col_idx = 0;
+		// process_qry_schema is just the same as the required qry columns,
+		// we only need to reset col_idx
+                for (auto it_scm = sky_qry_schema.begin(); it_scm != sky_qry_schema.end(); ++it_scm) {
+                    const struct col_info ci(col_idx, (*it_scm).type,
+                                             (*it_scm).is_key, (*it_scm).nullable, (*it_scm).name);
+                    sky_process_qry_schema.push_back(ci);
+                    col_idx++;
+                }
+                col_idx = 0;
+		// the tbl_schema is only those columns in qry-schema and preds vec
+		// we can just use the pushdown_cols_qry_schema in run-query.cc
+		// also, reset the col_idx
+                for (auto it_scm = sky_pushdown_cols_qry_schema.begin(); it_scm != sky_pushdown_cols_qry_schema.end(); ++it_scm) {
+                    const struct col_info ci(col_idx, (*it_scm).type,
+                                             (*it_scm).is_key, (*it_scm).nullable, (*it_scm).name);
+                    sky_process_tbl_schema.push_back(ci);
+                    col_idx++;
+                }
+		
+		if (debug) {
+			cout << "DEBUG: query.cc: worker: sky_process_tbl_schema= " << endl
+			     << schemaToString(sky_process_tbl_schema) << endl;
+			cout << "DEBUG: query.cc: worker: sky_process_qry_schema= " << endl
+			     << schemaToString(sky_process_qry_schema) << endl;
+		}
+		// reconstruct the preds vector using the new tbl_schema
+		Tables::predicate_vec sky_process_qry_preds;
+		sky_process_qry_preds = predsFromString(sky_process_tbl_schema, predsToString(sky_qry_preds, sky_tbl_schema));
+		
+		if (debug) {
+			cout << "DEBUG: query.cc: worker: sky_process_qry_preds: "
+			     << predsToString(sky_process_qry_preds, sky_process_tbl_schema) << endl;
+		}
+		int ret = processSkyFb(flatbldr,
+                                       sky_process_tbl_schema,
+                                       sky_process_qry_schema,
+                                       sky_process_qry_preds,
+                                       qop_groupby_cols,
+                                       qop_orderby_cols,
                                        fbmeta.blob_data,
                                        fbmeta.blob_size,
                                        errmsg);
@@ -659,6 +808,10 @@ void worker_exec_query_op()
                     reinterpret_cast<const char*>(flatbldr.GetBufferPointer());
                 sky_root root = getSkyRoot(processed_data, 0);
                 result_count += root.nrows;
+		if (debug) {
+			cout << "DEBUG: query.cc: worker: result count: " << result_count << endl;
+			cout << "DEBUG: query.cc: worker: flatbldr size: " << flatbldr.GetSize() << endl;
+		}    
                 print_data(processed_data, 0, SFT_FLATBUF_FLEX_ROW);
                 break;
             }
@@ -674,6 +827,8 @@ void worker_exec_query_op()
                               sky_tbl_schema,
                               sky_qry_schema,
                               sky_qry_preds,
+                              qop_groupby_cols,
+                              qop_orderby_cols,
                               fbmeta.blob_data,
                               fbmeta.blob_size,
                               errmsg);
