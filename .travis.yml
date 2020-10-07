@@ -7,6 +7,8 @@ services: docker
 install:
 - git clone --depth=1 https://github.com/systemslab/popper /tmp/popper
 - export PYTHONUNBUFFERED=1
+- echo -e "\n\n\n\n\n\n"
+- sleep 15
 - pip install /tmp/popper/src
 
 script: popper run --allow-undefined-secrets-in-ci
